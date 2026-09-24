@@ -28,6 +28,7 @@ from quark.torch import (
 )
 from quark.torch.export.api import _move_quantizer_to_dict
 from quark.torch.quantization.config.config import load_quant_algo_config_from_file
+import register_qwen3_5  # noqa: E402  (registers qwen3_5 template)
 from quark.torch.utils import TPDeviceManager
 
 # TODO: Using sys.path.append is bad practice.
@@ -133,6 +134,157 @@ def _build_quant_config(args: argparse.Namespace, model_config_type: str):
     return quant_config
 
 
+def _strip_gdn_cpu_norm_artifacts(model):
+    """[R19j EXPORT-FIX] Drop forward-time-only GDN '_cpu_norm' submodules that alias 'norm.weight'.
+
+    transformers' Qwen3.5 GDN forward lazily builds self._cpu_norm on the CPU branch
+    (modeling_qwen3_5.py) with `self._cpu_norm.weight = self.norm.weight`, leaving two
+    state-dict keys sharing one storage (e.g. layers.61.linear_attn.{norm,_cpu_norm}.weight).
+    save_pretrained's remove_tied_weights_from_state_dict rejects them because only
+    lm_head.weight is declared tied. norm keeps the AWQ-updated weight, so dropping
+    _cpu_norm loses nothing. Returns the list of stripped module names.
+    """
+    removed = []
+    for name, mod in list(model.named_modules()):
+        if getattr(mod, "_cpu_norm", None) is not None:
+            del mod._cpu_norm
+            removed.append(name)
+    if removed:
+        print(
+            "[EXPORT-FIX] stripped %d GDN _cpu_norm artifact(s): %s"
+            % (len(removed), ", ".join(removed)),
+            flush=True,
+        )
+    return removed
+
+
+def _restore_vision_bf16(model, src_dir):
+    """[R19j VISION-PARITY] Replace quantized vision-tower linears with bf16 nn.Linear loaded
+    from the source checkpoint, matching the AMD reference which EXCLUDES the entire vision
+    tower from AWQ (kept in bf16). Only touches 2-D bf16 '*.weight' tensors under model.visual.*
+    (the attn.qkv/proj + mlp.linear_fc1/fc2 projections); conv/norm params (1-D/3-D) are left
+    as-is. The matching 1-D bf16 '*.bias' is restored alongside its weight (R19j post-mortem:
+    an earlier version built these with bias=False, silently dropping all 110 vision linear
+    biases => systematically distorted image features / hallucinated vision). Returns the
+    number of restored linears."""
+    import glob
+    import torch.nn as _nn
+    from safetensors import safe_open
+
+    src_w = {}
+    src_b = {}
+    for fn in sorted(glob.glob(os.path.join(src_dir, "*.safetensors"))):
+        with safe_open(fn, framework="pt") as f:
+            for k in f.keys():
+                if "visual" not in k:
+                    continue
+                sl = f.get_slice(k)
+                if k.endswith(".weight"):
+                    if len(sl.get_shape()) == 2 and sl.get_dtype() == "BF16":
+                        src_w[k] = f.get_tensor(k)  # materialize only the vision tensors
+                elif k.endswith(".bias"):
+                    if len(sl.get_shape()) == 1 and sl.get_dtype() == "BF16":
+                        src_b[k] = f.get_tensor(k)
+    print("[VISION-PARITY] %d bf16 vision linear weights (+%d biases) found in source %s"
+          % (len(src_w), len(src_b), src_dir), flush=True)
+    restored = 0
+    n_bias = 0
+    for k, w in src_w.items():
+        pname = k[: -len(".weight")]
+        parent_name, _, child = pname.rpartition(".")
+        try:
+            parent = model.get_submodule(parent_name)
+        except AttributeError:
+            print("[VISION-PARITY] skip (no module) " + pname, flush=True)
+            continue
+        cur = getattr(parent, child, None)
+        # Replace only genuine Quark quantized linears (QuantLinear carries
+        # _weight_quantizer_inv); leave plain nn.Linear / Embedding / Parameter
+        # (e.g. model.visual.pos_embed) untouched.
+        if cur is None or not (hasattr(cur, "_weight_quantizer_inv") or "Quant" in type(cur).__name__):
+            continue
+        b = src_b.get(pname + ".bias")
+        newlin = _nn.Linear(w.shape[1], w.shape[0], bias=b is not None)
+        newlin.weight = _nn.Parameter(w.detach().clone(), requires_grad=False)
+        if b is not None:
+            newlin.bias = _nn.Parameter(b.detach().clone(), requires_grad=False)
+            n_bias += 1
+        setattr(parent, child, newlin)
+        restored += 1
+    print("[VISION-PARITY] restored %d quantized vision linears -> bf16 nn.Linear (%d with bias; %d bf16 candidates in source)"
+          % (restored, n_bias, len(src_w)), flush=True)
+    return restored
+
+
+def _patch_config_exclude_for_bf16_linears(out_dir):
+    """[R19j VISION-PARITY] Post-export fix: sync config.json's quantization_config.exclude
+    with the bf16 (unquantized) vision-tower + MTP linears actually present on disk.
+
+    The exporter derives `exclude` from the QConfig baked into the guard snapshot
+    (["lm_head"]), which does NOT reflect (a) the vision linears we restored to bf16 via
+    _restore_vision_bf16, nor (b) the mtp.* weights that patch_missing_weights appends as
+    bf16 after the shard write. A config-driven loader treats `exclude` as the source of
+    truth for which linears stay unquantized, so it would otherwise instantiate those
+    modules as QuantLinear and fail against their bf16 weights (no weight_scale on disk).
+    We derive the set from the ACTUAL exported shards (BF16 keys ending '.weight' under
+    *.visual.* [2-D, module-name form] or top-level mtp.* [any dim, both module-name and
+    tensor-name forms]), making the result self-consistent with what is on disk. Mirrors
+    the AMD reference, whose exclude lists the entire vision tower (111 visual entries)
+    plus the mtp.* weights. embed_tokens is deliberately NOT added (AMD leaves it out too)."""
+    import glob
+    import json
+    from safetensors import safe_open
+
+    cfg_path = os.path.join(out_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        print("[CONFIG-EXCLUDE] no config.json at " + str(out_dir) + "; skipping", flush=True)
+        return
+    with open(cfg_path) as fp:
+        cfg = json.load(fp)
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict):
+        print("[CONFIG-EXCLUDE] no quantization_config block; leaving config untouched", flush=True)
+        return
+
+    bf16_lin = set()
+    for fn in sorted(glob.glob(os.path.join(out_dir, "*.safetensors"))):
+        with safe_open(fn, framework="pt") as f:
+            for k in f.keys():
+                # Unquantized tensors shipped as bf16: vision tower (parity mode) + MTP
+                # head (restored bf16 by patch_missing_weights). Not blanket-all-bf16:
+                # embed_tokens stays out of exclude, matching the AMD reference.
+                if not (k.endswith(".weight") and (".visual." in k or k.startswith("mtp."))):
+                    continue
+                sl = f.get_slice(k)
+                if sl.get_dtype() != "BF16":
+                    continue
+                if ".visual." in k:
+                    # Vision: 2-D linears only, module-name form (AMD's visual style).
+                    if len(sl.get_shape()) == 2:
+                        bf16_lin.add(k[: -len(".weight")])
+                else:
+                    # MTP: every bf16 param, in BOTH module-name and tensor-name forms
+                    # (AMD lists the tensor-name form; emitting both so either matching
+                    # style in a config-driven loader hits).
+                    bf16_lin.add(k[: -len(".weight")])
+                    bf16_lin.add(k)
+    excl = set(qc.get("exclude") or [])
+    added = sorted(bf16_lin - excl)
+    qc["exclude"] = sorted(excl | bf16_lin)
+    with open(cfg_path, "w") as fp:
+        json.dump(cfg, fp, indent=2)
+    print(
+        "[CONFIG-EXCLUDE] %d bf16 unquantized linear(s) on disk (vision+mtp); added %d new exclude entr%s (%s)"
+        % (
+            len(bf16_lin),
+            len(added),
+            "y" if added else "ies",
+            ", ".join(added[:6]) + ("..." if len(added) > 6 else ""),
+        ),
+        flush=True,
+    )
+
+
 def main(args: argparse.Namespace) -> None:
     if args.revision is not None and os.path.isdir(args.model_dir):
         raise ValueError(
@@ -173,8 +325,20 @@ def main(args: argparse.Namespace) -> None:
 
     # 1. Define original model
     model = None
+    # [R19j RESUME-GUARD] Fast export+eval retry from a pre-export snapshot:
+    # load the fully-AWQ'd frozen model and skip load/calib/AWQ below.
+    _resumed = False
+    if getattr(args, "resume_guard", None):
+        print("\n[RESUME-GUARD] loading pre-export model from " + str(args.resume_guard), flush=True)
+        import cloudpickle as _cp
+
+        with open(args.resume_guard, "rb") as _gf:
+            model = _cp.load(_gf)
+        args.skip_quantization = True
+        _resumed = True
+        print("[RESUME-GUARD] loaded; skipping load/calib/AWQ -> export + PPL eval", flush=True)
     # Load the pretrained model for quantization or for reload later (the old way).
-    if not args.model_reload or args.import_model_dir:
+    if not _resumed and (not args.model_reload or args.import_model_dir):
         print("\n[INFO]: Loading model ...")
 
         # We currently use CPU memory to load large models because GPU memory is typically smaller.
@@ -220,11 +384,11 @@ def main(args: argparse.Namespace) -> None:
         TPDeviceManager.tp_mesh_init()
 
     # 2. (Optional) Reload quantized model
-    if args.params_load:
+    if not _resumed and args.params_load:
         print("\nRestore quantized model from json and safetensors file ...")
         model = load_params(model, json_path=args.json_path, safetensors_path=args.safetensors_path)
         args.skip_quantization = True
-    elif args.model_reload:
+    elif not _resumed and args.model_reload:
         # Use import_model_dir if provided (separate quantized checkpoint), otherwise model_dir is the checkpoint itself.
         reload_dir = args.import_model_dir or args.model_dir
         print("\nRestore quantized model from hf_format safetensors file ...")
@@ -315,6 +479,7 @@ def main(args: argparse.Namespace) -> None:
 
         # In-place replacement of model modules with quantized versions
         quantizer = ModelQuantizer(quant_config, args.multi_device)
+        _vis = getattr(getattr(model, "model", None), "visual", None); (_vis.to("cpu") if _vis is not None else None); torch.cuda.empty_cache(); print("[VISION-OFFLOAD] visual=" + ("found->CPU" if _vis is not None else "NONE"), flush=True)
         model = quantizer.quantize_model(model, calib_dataloader)
         args.exclude_layers = quantizer.config.exclude
 
@@ -343,6 +508,32 @@ def main(args: argparse.Namespace) -> None:
         # Export option 1: hugging-face safetensors format
         if "hf_format" in args.model_export:
             print("\n[INFO]: Exporting hugging face format safetensors...")
+            # [EXPORT-GUARD-V2] snapshot frozen model for fast export retry
+            # (skipped on --resume_guard: the guard already exists and is identical)
+            if not _resumed:
+                try:
+                    import os as _os
+                    # Fallback location: $QUARK_WORK_DIR (drive scripts set this), else cwd.
+                    _gp = _os.environ.get(
+                        "QUARK_EXPORT_GUARD_PATH",
+                        _os.path.join(
+                            _os.environ.get("QUARK_WORK_DIR", _os.getcwd()),
+                            "quark_pre_export_model.pt"))
+                    try:
+                        import cloudpickle as _cp
+                        with open(_gp, "wb") as _gf:
+                            _cp.dump(model, _gf)
+                        print("[EXPORT-GUARD] saved (cloudpickle) -> " + _gp, flush=True)
+                    except ImportError:
+                        torch.save(model, _gp)
+                        print("[EXPORT-GUARD] saved (torch) -> " + _gp, flush=True)
+                except Exception as _e:
+                    print("[EXPORT-GUARD] save failed: " + repr(_e), flush=True)
+            # [R19j VISION-PARITY] optionally restore vision-tower linears to bf16 (AMD parity)
+            if getattr(args, "restore_vision_bf16", None):
+                _restore_vision_bf16(model, args.restore_vision_bf16)
+            # [R19j EXPORT-FIX] drop GDN _cpu_norm alias artifacts before save_pretrained
+            _strip_gdn_cpu_norm_artifacts(model)
             with profiler.scope(ProfileStep.EXPORT_HF_SAFETENSORS), torch.no_grad():
                 export_safetensors(
                     model=model,
@@ -351,6 +542,10 @@ def main(args: argparse.Namespace) -> None:
                     weight_format=args.export_weight_format,
                     pack_method=args.pack_method,
                 )
+                # [R19j VISION-PARITY] sync config.json exclude with the bf16 vision linears
+                # (parity model only; the vision-quantized resume leaves exclude=["lm_head"]).
+                if getattr(args, "restore_vision_bf16", None):
+                    _patch_config_exclude_for_bf16_linears(args.output_dir)
 
         # Export option 2: onnx
         if "onnx" in args.model_export:
@@ -547,6 +742,20 @@ if __name__ == "__main__":
         help="[Deprecated: use --model_dir instead] directory of hf or quark model, override model directory for reload, if not provided, --model_dir is used.",
     )
     parser.add_argument("--params_load", help="Model parameters load", action="store_true")
+    parser.add_argument(
+        "--resume_guard",
+        help="[R19j] Path to a pre-export model snapshot (cloudpickled fully-AWQ'd, frozen, "
+        "QuantLinear-ready model). When set, skips model load / calibration / AWQ and goes "
+        "straight to export + PPL eval. Fast retry after an export-stage crash.",
+        default=None,
+    )
+    parser.add_argument(
+        "--restore_vision_bf16",
+        help="[R19j] Source HF checkpoint dir. With --resume_guard, restores the vision-tower "
+        "linear layers to bf16 from this checkpoint before export, matching the AMD reference "
+        "which excludes the vision tower from AWQ. Produces the ~19.8GB parity model.",
+        default=None,
+    )
     parser.add_argument("--json_path", help="Specify the path of saved json file")
     parser.add_argument("--safetensors_path", help="Specify the path of saved safetensors file")
 
